@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+orange3
+orange3-imageanalytics
+Pillow
+numpy
+scikit-learn
+python-multipart
