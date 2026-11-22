@@ -1,18 +1,23 @@
 import pickle
+import io
+from pathlib import Path
+
 import numpy as np
 import torch
 import torchvision.models as models
 import torchvision.transforms as transforms
-from PIL import Image
-import io
 
+from PIL import Image
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
 from Orange.data import Table
+from Orange.base import Model
+
 
 app = FastAPI()
 
-# Allow all websites to talk to this server
+# Allow your Netlify website to connect to this backend
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,49 +25,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 1. LOAD THE ORANGE MODEL ---
-# ⚠️ IMPORTANT: Change "model.pkcls" to the exact name of the file you uploaded!
-with open("fruit_model.pkcls", "rb") as f:
-    orange_model = pickle.load(f)
 
-# --- 2. REBUILD THE DOMAIN ---
-domain = orange_model.domain
+# --------------------------------------------------
+# 1. LOAD THE ORANGE MODEL
+# --------------------------------------------------
 
-# --- 3. LOAD SQUEEZENET ---
+MODEL_PATH = Path(__file__).resolve().parent / "fruit_model.pkcls"
+
+try:
+    with open(MODEL_PATH, "rb") as f:
+        orange_model = pickle.load(f)
+
+    domain = orange_model.domain
+
+except Exception as e:
+    raise RuntimeError(f"Could not load Orange model: {e}")
+
+
+# --------------------------------------------------
+# 2. LOAD SQUEEZENET
+# --------------------------------------------------
+
 squeezenet = models.squeezenet1_1(pretrained=True)
-squeezenet.classifier[1] = torch.nn.Identity() 
+
+# Remove the final classification layer
+squeezenet.classifier[1] = torch.nn.Identity()
+
 squeezenet.eval()
+
+
+# --------------------------------------------------
+# 3. IMAGE PREPROCESSING
+# --------------------------------------------------
 
 preprocess = transforms.Compose([
     transforms.Resize(256),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    ),
 ])
+
+
+# --------------------------------------------------
+# 4. HEALTH CHECK
+# --------------------------------------------------
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
+# --------------------------------------------------
+# 5. FRUIT PREDICTION
+# --------------------------------------------------
+
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    image_bytes = await file.read()
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid image file")
 
-    # Convert image to SqueezeNet embeddings
-    img_tensor = preprocess(img).unsqueeze(0) 
-    
+    # Read uploaded image
+    image_bytes = await file.read()
+
+    try:
+        img = Image.open(
+            io.BytesIO(image_bytes)
+        ).convert("RGB")
+
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid image file"
+        )
+
+    # Convert image into a tensor
+    img_tensor = preprocess(img).unsqueeze(0)
+
+    # Extract SqueezeNet features
     with torch.no_grad():
         embeddings = squeezenet(img_tensor).flatten().numpy()
 
-    # Feed embeddings to Orange model
-    row = Table.from_numpy(domain, np.array([embeddings], dtype=object))
-    prediction = orange_model(row)
-    
-    # Return the result
+    # Convert features into a numeric array
+    features = np.asarray(
+        embeddings,
+        dtype=np.float32
+    ).reshape(1, -1)
+
+    # Check feature compatibility
+    if features.shape[1] != len(domain.attributes):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Feature mismatch: model expects "
+                f"{len(domain.attributes)} features, "
+                f"but received {features.shape[1]}"
+            )
+        )
+
+    # Create Orange data table
+    row = Table.from_numpy(
+        domain,
+        X=features
+    )
+
+    # Get prediction and probabilities
+    values, probabilities = orange_model(
+        row,
+        ret=Model.ValueProbs
+    )
+
+    # Identify predicted class
+    class_index = int(values[0])
+    prediction_label = domain.class_var.values[class_index]
+
+    # Get confidence
+    confidence = float(probabilities[0][class_index])
+
+    # Return result to website
     return {
-        "prediction": str(prediction[0])
+        "prediction": str(prediction_label),
+        "confidence": confidence
     }
